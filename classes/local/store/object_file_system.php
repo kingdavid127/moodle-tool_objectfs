@@ -257,18 +257,7 @@ abstract class object_file_system extends \file_system_filedir {
             return true;
         }
 
-        $path = $this->get_external_path_from_storedfile($file);
-        error_clear_last();
-        $readable = @is_readable($path);
-        if (!$readable) {
-            $error = error_get_last();
-            if ($error !== null) {
-                throw new \Exception(
-                    'Transient external storage error: ' . ($error['message'] ?? 'Unknown error')
-                );
-            }
-        }
-        return $readable;
+        return $this->externalclient->object_exists_by_hash($file->get_contenthash());
     }
 
     /**
@@ -286,24 +275,11 @@ abstract class object_file_system extends \file_system_filedir {
             return false;
         }
 
-        $path = $this->get_external_path_from_hash($contenthash, false);
-
-        // Suppress the PHP Warning from the S3 StreamWrapper so we can inspect it ourselves.
-        // If is_readable returns false AND a PHP error was raised, the failure is transient
-        // (e.g. a connectivity blip) rather than the object genuinely being absent. In that
-        // case we throw so callers can retry rather than silently recording OBJECT_LOCATION_ERROR.
-        error_clear_last();
-        $readable = @is_readable($path);
-        if (!$readable) {
-            $error = error_get_last();
-            if ($error !== null) {
-                throw new \Exception(
-                    'Transient external storage error for ' . $contenthash . ': ' .
-                    ($error['message'] ?? 'Unknown error')
-                );
-            }
-        }
-        return $readable;
+        // The client decides what "absent" means for its store and throws when the
+        // store could not be asked, so a connectivity blip is never recorded as a
+        // missing object (OBJECT_LOCATION_ERROR). A stat on the stream wrapper cannot
+        // make that distinction: PHP passes STREAM_URL_STAT_QUIET for is_readable().
+        return $this->externalclient->object_exists_by_hash($contenthash);
     }
 
     /**
@@ -840,7 +816,31 @@ abstract class object_file_system extends \file_system_filedir {
         $localpath = $this->get_local_path_from_hash($contenthash);
         $externalpath = $this->get_external_path_from_hash($contenthash);
 
-        return copy($externalpath, $localpath);
+        // Download to a temporary name and rename into place, as core does when it adds
+        // a file: readers never take the object lock, so writing straight onto the content
+        // path lets a concurrent request serve a partially written file, and an interrupted
+        // download would leave a truncated file that later location checks accept as valid.
+        // The suffix differs from core's "<hash>.tmp" so the two cannot clobber each other;
+        // reconcile_filedir removes stale "*.tmp" files by extension either way.
+        $tmppath = $localpath . '.pull.tmp';
+        if (file_exists($tmppath)) {
+            @unlink($tmppath);
+        }
+        if (!copy($externalpath, $tmppath)) {
+            @unlink($tmppath);
+            return false;
+        }
+        if (self::hash_from_path($tmppath) !== $contenthash) {
+            // Short or corrupt read from the store: do not install it as the pool file.
+            @unlink($tmppath);
+            $this->logger->error_log('ERROR: pulled ' . $externalpath . ' but its content hash does not match');
+            return false;
+        }
+        if (!rename($tmppath, $localpath)) {
+            @unlink($tmppath);
+            return false;
+        }
+        return true;
     }
 
     /**

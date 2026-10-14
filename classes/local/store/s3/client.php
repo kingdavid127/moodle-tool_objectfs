@@ -173,6 +173,12 @@ class client extends object_client_base {
 
         if (empty($config->s3_usesdkcreds)) {
             $options['credentials'] = ['key' => $config->s3_key, 'secret' => $config->s3_secret];
+        } else if (!empty($config->s3_cachesdkcreds)) {
+            // The SDK only memoises the credentials it resolves (instance profile, ECS task
+            // role, SSO) within one process. Under PHP-FPM that means every request that
+            // touches S3 first repeats the metadata-service round trips. Handing the SDK a
+            // cache makes it share the resolved credentials across requests until they expire.
+            $options['credentials'] = new credential_cache();
         }
 
         if ($config->useproxy) {
@@ -222,6 +228,57 @@ class client extends object_client_base {
         $md5 = trim($result['ETag'], '"'); // Strip quotation marks.
 
         return $md5;
+    }
+
+    /**
+     * Whether the object for the given content hash exists in the bucket.
+     *
+     * Uses a HEAD request directly rather than is_readable() on the stream wrapper:
+     * PHP stats the wrapper with STREAM_URL_STAT_QUIET for is_readable(), so the SDK
+     * swallows every failure and a connectivity or credential problem is
+     * indistinguishable from a missing object. Here only a 404 means "absent"; any
+     * other failure is thrown so callers (location checks, the deleter) can treat it
+     * as transient instead of recording the object as missing. S3 also answers a HEAD
+     * on a bucket that does not exist with a bare 404, so a misconfigured bucket name
+     * reads as "absent" here (every object stays LOCAL, nothing is deleted); the
+     * connection check on the settings page is what reports that case.
+     *
+     * @param string $contenthash
+     * @return bool true when the object is present, false when S3 says it does not exist
+     * @throws \Exception when the request itself failed (connectivity, credentials, permissions)
+     */
+    public function object_exists_by_hash(string $contenthash): bool {
+        if (!$this->is_functional()) {
+            // No client at all: same answer the unregistered stream wrapper used to give.
+            return false;
+        }
+
+        try {
+            $this->client->headObject([
+                'Bucket' => $this->bucket,
+                'Key' => $this->bucketkeyprefix . $this->get_filepath_from_hash($contenthash),
+            ]);
+            return true;
+        } catch (\Aws\S3\Exception\S3Exception $e) {
+            // HEAD responses carry no body, so the SDK reports a missing key as a
+            // 404 status with the error code 'NotFound' rather than 'NoSuchKey'.
+            if ((int) $e->getStatusCode() === 404 || in_array($e->getAwsErrorCode(), ['NotFound', 'NoSuchKey'], true)) {
+                return false;
+            }
+            throw new \Exception(
+                'Transient external storage error for ' . $contenthash . ': ' .
+                $e->getAwsErrorCode() . ' ' . $e->getMessage(),
+                0,
+                $e
+            );
+        } catch (\Aws\Exception\AwsException $e) {
+            // Credential resolution and connection failures surface as other AwsException subclasses.
+            throw new \Exception(
+                'Transient external storage error for ' . $contenthash . ': ' . $e->getMessage(),
+                0,
+                $e
+            );
+        }
     }
 
     /**
@@ -468,7 +525,14 @@ class client extends object_client_base {
             0
         ));
 
-        if (empty($config->s3_usesdkcreds)) {
+        if (!empty($config->s3_usesdkcreds)) {
+            $settings->add(new \admin_setting_configcheckbox(
+                'tool_objectfs/s3_cachesdkcreds',
+                new \lang_string('settings:aws:cachesdkcreds', 'tool_objectfs'),
+                new \lang_string('settings:aws:cachesdkcreds_help', 'tool_objectfs'),
+                1
+            ));
+        } else {
             $settings->add(new \admin_setting_check('tool_objectfs/s3_checksdkcreds', new \tool_objectfs\check\s3_sdkcreds()));
 
             $settings->add(new \admin_setting_configtext(

@@ -92,6 +92,15 @@ interface object_client {
     public function verify_object($contenthash, $localpath);
 
     /**
+     * Whether the object for the given content hash exists in the external store.
+     *
+     * @param string $contenthash
+     * @return bool true when the object is confirmed present, false when confirmed absent
+     * @throws \Exception when the store could not be asked (connectivity, credentials, permissions)
+     */
+    public function object_exists_by_hash(string $contenthash): bool;
+
+    /**
      * generate_presigned_url
      * @param string $contenthash
      * @param array $headers

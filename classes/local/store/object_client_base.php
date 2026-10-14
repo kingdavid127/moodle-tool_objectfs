@@ -91,6 +91,23 @@ abstract class object_client_base implements object_client {
     }
 
     /**
+     * Whether the object for the given content hash exists in the external store.
+     *
+     * Default implementation: a stat through the client's stream wrapper. PHP calls
+     * url_stat() with STREAM_URL_STAT_QUIET for is_readable(), so a wrapper cannot
+     * report a failed request as anything other than "not readable". Clients whose
+     * SDK can distinguish a missing object from a failed request (S3 does, with a
+     * HEAD request) should override this and throw on failure.
+     *
+     * @param string $contenthash
+     * @return bool true when the object is confirmed present, false when confirmed absent
+     * @throws \Exception when the store could not be asked (connectivity, credentials, permissions)
+     */
+    public function object_exists_by_hash(string $contenthash): bool {
+        return is_readable($this->get_fullpath_from_hash($contenthash));
+    }
+
+    /**
      * Does the storage support pre-signed URLs.
      *
      * @return bool.
